@@ -23,7 +23,7 @@ const int kOledI2cDev = 1;
 
 // Digital I/O pin configuration
 const unsigned int eventStartPins[] = {0, 12};
-const unsigned int eventEndPins[] = {1, 1};
+const unsigned int eventEndPins[] = {1, 2};
 const unsigned int kNumStartPins =
     sizeof(eventStartPins) / sizeof(eventStartPins[0]);
 const unsigned int kNumEndPins = sizeof(eventEndPins) / sizeof(eventEndPins[0]);
@@ -65,6 +65,7 @@ struct RTTimingEvent {
   uint64_t sample_data[kMaxChannelsPerStream];
   size_t sample_data_count;
   double sample_timestamp;  // This will store the interpolated LSL time
+  double time_correction;   // Time correction offset for this inlet (LSL events only)
 
   // Pin states snapshot
   uint16_t pin_states_snapshot;  // Bit field for up to 16 pins
@@ -77,6 +78,7 @@ struct RTTimingEvent {
         is_start_pin(false),
         sample_data_count(0),
         sample_timestamp(0.0),
+        time_correction(0.0),
         pin_states_snapshot(0) {
     memset(stream_name, 0, kMaxStreamNameLength);
     memset(stream_source, 0, kMaxStreamSourceLength);
@@ -132,6 +134,7 @@ std::vector<lsl::stream_info> availableStreams;
 std::vector<lsl::stream_inlet*> streamInlets;
 std::vector<std::string> streamNames;
 std::vector<std::string> streamSources;
+std::vector<double> streamTimeCorrections;  // Store time corrections per inlet
 bool streamsResolved = false;
 
 // RT-safe event queue
@@ -166,6 +169,7 @@ AuxiliaryTask gPullSamplesTask;
 AuxiliaryTask gLogWriterTask;
 AuxiliaryTask gDisplayPinStatesTask;
 AuxiliaryTask gTimestampUpdateTask;
+AuxiliaryTask gTimeCorrectionUpdateTask;
 
 // LSL resolver
 lsl::continuous_resolver* resolver = nullptr;
@@ -176,6 +180,7 @@ void pullSamples(void*);
 void writeLogData(void*);
 void displayPinStates(void*);
 void updateLSLTimestamp(void*);
+void updateTimeCorrections(void*);
 uint16_t getPinStateBitfield();
 void setPinStateBit(uint16_t& bitfield, int index, bool state);
 bool getPinStateBit(uint16_t bitfield, int index);
@@ -234,6 +239,29 @@ void updateLSLTimestamp(void*) {
   // Also update simple timestamp for non-critical uses
   lastLSLTimestamp.store(syncBuffers[writeIndex].lslTime,
                          std::memory_order_relaxed);
+}
+
+// Update time corrections for all active inlets
+void updateTimeCorrections(void*) {
+  if (!streamsResolved || streamInlets.empty()) return;
+  
+  for (size_t i = 0; i < streamInlets.size(); i++) {
+    if (streamInlets[i]) {
+      try {
+        // Get time correction - first call may take longer, subsequent calls are fast
+        double correction = streamInlets[i]->time_correction(0.1);  // 100ms timeout
+        
+        // Ensure we have enough space in the corrections vector
+        if (streamTimeCorrections.size() <= i) {
+          streamTimeCorrections.resize(i + 1, 0.0);
+        }
+        
+        streamTimeCorrections[i] = correction;
+      } catch (std::exception& e) {
+        rt_printf("Error getting time correction for stream %zu: %s\n", i, e.what());
+      }
+    }
+  }
 }
 
 // RT-safe interpolation of LSL timestamp
@@ -313,11 +341,15 @@ bool setup(BelaContext* context, void* userData) {
            &updateLSLTimestamp, 85, "timestamp-update")) == 0)
     return false;
 
+  if ((gTimeCorrectionUpdateTask = Bela_createAuxiliaryTask(
+           &updateTimeCorrections, 70, "time-correction-update")) == 0)
+    return false;
+
   // Initialize log file
   std::ofstream logFile(kLogFileName, std::ios::out | std::ios::trunc);
   if (logFile.is_open()) {
     logFile << "system_timestamp,lsl_timestamp,event_type,pin_number,pin_state,is_start_pin,"
-               "stream_name,stream_source,sample_timestamp,sample_data,pin_states\n";
+               "stream_name,stream_source,sample_timestamp,sample_data,time_correction,pin_states\n";
     logFile.close();
     rt_printf("Created log file: %s\n", kLogFileName.c_str());
   } else {
@@ -459,6 +491,11 @@ void render(BelaContext* context, void* userData) {
   if (renderCount % (fs / periodSize) == 0 && shouldResolveStreams) {
     Bela_scheduleAuxiliaryTask(gResolveStreamsTask);
   }
+  
+  // Update time corrections every 5 seconds when streams are available
+  if (!streamInlets.empty() && renderCount % (fs / periodSize * 5) == 0) {
+    Bela_scheduleAuxiliaryTask(gTimeCorrectionUpdateTask);
+  }
 
   // Pull samples more frequently, when streams are available
   if (!streamInlets.empty() && renderCount % 10 == 0) {
@@ -510,6 +547,7 @@ void cleanup(BelaContext* context, void* userData) {
   streamInlets.clear();
   streamNames.clear();
   streamSources.clear();
+  streamTimeCorrections.clear();
 
   // Clean up resolver
   if (resolver) {
@@ -547,6 +585,7 @@ void resolveStreams(void*) {
     streamInlets.clear();
     streamNames.clear();
     streamSources.clear();
+    streamTimeCorrections.clear();
 
     size_t validStreams = 0;
     for (const auto& info : availableStreams) {
@@ -567,6 +606,17 @@ void resolveStreams(void*) {
           streamNames.push_back(info.name());
           streamSources.push_back(info.source_id());
           inlet->open_stream(1.0);
+          
+          // Get initial time correction (may take longer first time)
+          try {
+            double initial_correction = inlet->time_correction(2.0);  // 2s timeout for initial
+            streamTimeCorrections.push_back(initial_correction);
+          } catch (std::exception& e) {
+            rt_printf("Warning: Could not get initial time correction for %s: %s\n", 
+                     info.name().c_str(), e.what());
+            streamTimeCorrections.push_back(0.0);  // Default to 0 if failed
+          }
+          
           validStreams++;
 
           rt_printf("Opened stream: %s (%s), %d channels, format: %d\n",
@@ -651,6 +701,14 @@ void pullSamples(void*) {
         }
 
         event.sample_timestamp = sampleTimestamp;
+        
+        // Add time correction if available for this inlet
+        if (i < streamTimeCorrections.size()) {
+          event.time_correction = streamTimeCorrections[i];
+        } else {
+          event.time_correction = 0.0;
+        }
+        
         event.pin_states_snapshot =
             currentPinStatesAtomic.load(std::memory_order_relaxed);
 
@@ -689,6 +747,11 @@ void pullSamples(void*) {
   if (streamSources.size() != streamInlets.size()) {
     streamSources.resize(streamInlets.size());
   }
+  
+  // Update time corrections
+  if (streamTimeCorrections.size() != streamInlets.size()) {
+    streamTimeCorrections.resize(streamInlets.size(), 0.0);
+  }
 
   if (streamInlets.empty()) {
     streamsResolved = false;
@@ -713,7 +776,7 @@ void writeLogData(void*) {
     if (event.type == RTTimingEvent::PIN_CHANGE) {
       logFile << "PIN_CHANGE," << event.pin_number << ","
               << (event.pin_state ? "1" : "0") << ","
-              << (event.is_start_pin ? "1" : "0") << ",,,,,";
+              << (event.is_start_pin ? "1" : "0") << ",,,,,,";
     } else {
       logFile << "LSL_SAMPLE,,,," << event.stream_name << ","
               << event.stream_source << ","
@@ -724,7 +787,7 @@ void writeLogData(void*) {
         logFile << event.sample_data[i];
         if (i < event.sample_data_count - 1) logFile << ";";
       }
-      logFile << ",";
+      logFile << "," << std::fixed << std::setprecision(9) << event.time_correction << ",";
     }
 
     // Add pin states
@@ -751,7 +814,7 @@ void writeLogData(void*) {
       logFile << event.sample_data[i];
       if (i < event.sample_data_count - 1) logFile << ";";
     }
-    logFile << ",";
+    logFile << "," << std::fixed << std::setprecision(9) << event.time_correction << ",";
 
     for (int i = 0; i < kTotalPins; i++) {
       logFile << (getPinStateBit(event.pin_states_snapshot, i) ? "1" : "0");
