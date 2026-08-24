@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <sys/fcntl.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,7 +31,7 @@ uint8_t _i2c_init(int i2c, int dev_addr)
 		}
 		return 0;
 	}
-	
+
 	// assume done init already
 	return 0;
 }
@@ -43,7 +44,7 @@ uint8_t _i2c_close()
 		file_i2c = 0;
 		return 0;
 	}
-	
+
 	return 1;
 }
 
@@ -51,9 +52,9 @@ uint8_t _i2c_write(uint8_t* ptr, int16_t len)
 {
 	if (file_i2c == 0 || ptr == 0 || len <= 0)
 		return 1;
-				
+
 	write(file_i2c, ptr, len);
-	
+
 	return 0;
 }
 
@@ -61,7 +62,7 @@ uint8_t _i2c_read(uint8_t *ptr, int16_t len)
 {
 	if (file_i2c == 0 || ptr == 0 || len <= 0)
 		return 1;
-				
+
 	read(file_i2c, ptr, len);
 
 	return 0;

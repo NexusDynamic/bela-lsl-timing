@@ -7,3 +7,10 @@
 
 # ide
 .vscode/
+
+# session data
+logs/
+
+# python
+__pycache__/
+*.pyc
