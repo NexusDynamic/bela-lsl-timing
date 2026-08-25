@@ -161,6 +161,16 @@ typedef enum {
 	/// The supplied max_buf should be scaled by 0.001.
 	transp_bufsize_thousandths = 2,
 
+	/// Use synchronous (blocking) socket writes for zero-copy data transfer.
+	/// When enabled, push_sample/push_chunk write the caller's buffer directly to every
+	/// connected consumer and block until the data has been handed to the OS for all of them.
+	/// Reduces CPU usage for high-bandwidth streams at the cost of increased call latency.
+	/// Notes:
+	///  - Not compatible with string-format streams (variable-size samples).
+	///  - Single-producer: push from only one thread at a time (the sync path is unsynchronized).
+	///  - The pushthrough flag is ignored; every push sends immediately (no internal buffering).
+	transp_sync_blocking = 4,
+
 	// prevent compilers from assuming an instance fits in a single byte
 	_lsl_transport_options_maxval = 0x7f000000
 } lsl_transport_options_t;
@@ -191,7 +201,7 @@ extern LIBLSL_C_API const char *lsl_last_error(void);
  * Clients with different minor versions are protocol-compatible while clients
  * with different major versions will refuse to work together.
  */
-extern LIBLSL_C_API int32_t lsl_protocol_version();
+extern LIBLSL_C_API int32_t lsl_protocol_version( void );
 
 /**
  * Version of the liblsl library.
@@ -199,7 +209,7 @@ extern LIBLSL_C_API int32_t lsl_protocol_version();
  * The major version is `library_version() / 100;`
  * The minor version is `library_version() % 100;`
  */
-extern LIBLSL_C_API int32_t lsl_library_version();
+extern LIBLSL_C_API int32_t lsl_library_version( void );
 
 /**
  * Get a string containing library information.
@@ -217,7 +227,7 @@ extern LIBLSL_C_API const char *lsl_library_info(void);
  * delays), it can be used as an offset to lsl_local_clock() to obtain a better estimate of
  * when a sample was actually captured. See lsl_push_sample() for a use case.
  */
-extern LIBLSL_C_API double lsl_local_clock();
+extern LIBLSL_C_API double lsl_local_clock( void );
 
 /**
  * Deallocate a string that has been transferred to the application.
@@ -227,3 +237,23 @@ extern LIBLSL_C_API double lsl_local_clock();
  * no free() method is available (e.g., in some scripting languages).
  */
 extern LIBLSL_C_API void lsl_destroy_string(char *s);
+
+/**
+ * Set the path of the configuration file to be used by liblsl.
+ *
+ * This must be called before any other LSL function; otherwise the setting
+ * has no effect, as the configuration is loaded lazily on first use.
+ * See also the precedence list in api_config.h.
+ */
+extern LIBLSL_C_API void lsl_set_config_filename(const char *filename);
+
+/**
+ * Set the configuration content (as an INI string) to be used by liblsl.
+ *
+ * This must be called before any other LSL function; otherwise the setting
+ * has no effect, as the configuration is loaded lazily on first use.
+ * When set, this content takes precedence over any configuration file.
+ *
+ * @note The content is discarded after liblsl has initialized.
+ */
+extern LIBLSL_C_API void lsl_set_config_content(const char *content);

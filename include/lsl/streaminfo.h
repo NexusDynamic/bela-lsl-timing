@@ -126,6 +126,14 @@ extern LIBLSL_C_API double lsl_get_created_at(lsl_streaminfo info);
 extern LIBLSL_C_API const char *lsl_get_uid(lsl_streaminfo info);
 
 /**
+ * Reset the UID of the stream info to a new random value.
+ *
+ * This can be used to generate a UID if one doesn't exist.
+ * @return An immutable library-owned pointer to the new string value. @sa lsl_destroy_string()
+ */
+extern LIBLSL_C_API const char *lsl_reset_uid(lsl_streaminfo info);
+
+/**
  * Session ID for the given stream.
  *
  * The session id is an optional human-assigned identifier of the recording session.
@@ -160,7 +168,7 @@ extern LIBLSL_C_API lsl_xml_ptr lsl_get_desc(lsl_streaminfo info);
  * This yields an XML document (in string form) whose top-level element is `<info>`. The info
  * element contains one element for each field of the streaminfo class, including:
  *
- *   - the core elements `<name>`, `<type>`, `<channel_count`, `<nominal_srate>`,
+ *   - the core elements `<name>`, `<type>`, `<channel_count>`, `<nominal_srate>`,
  *   `<channel_format>`, `<source_id>`
  *   - the misc elements `<version>`, `<created_at>`, `<uid>`, `<session_id>`,
  *   `<v4address>`, `<v4data_port>`, `<v4service_port>`, `<v6address>`, `<v6data_port>`,

@@ -1,0 +1,77 @@
+--- a/src/api_config.h	2026-08-04 10:25:08
++++ b/src/api_config.h	2026-08-25 16:51:14
+@@ -313,8 +313,7 @@
+ };
+ 
+ // initialize configuration file name
+-inline std::string api_config::api_config_filename_ = "";
+-inline std::string api_config::api_config_content_ = "";
++// definitions moved to api_config.cpp (C++17 inline variables need GCC 7+)
+ 
+ } // namespace lsl
+ 
+--- a/src/api_config.cpp	2026-08-04 10:25:08
++++ b/src/api_config.cpp	2026-08-25 16:51:14
+@@ -13,6 +13,9 @@
+ 
+ using namespace lsl;
+ 
++std::string api_config::api_config_filename_ = "";
++std::string api_config::api_config_content_ = "";
++
+ /// Substitute the "~" character by the full home directory (according to environment variables).
+ std::string expand_tilde(const std::string &filename) {
+ 	// NOLINTBEGIN(concurrency-mt-unsafe)
+--- a/src/stream_info_impl.cpp	2026-08-04 10:25:08
++++ b/src/stream_info_impl.cpp	2026-08-25 16:52:11
+@@ -17,7 +17,7 @@
+ using lsl::to_string;
+ 
+ // Helper to support both pugixml < 1.15 (no string_view) and >= 1.15
+-#if PUGIXML_VERSION >= 1150
++#if PUGIXML_VERSION >= 1150 && defined(__cpp_lib_string_view)
+ inline std::string_view pugi_str(const std::string &value) { return value; }
+ #else
+ inline const char *pugi_str(const std::string &value) { return value.c_str(); }
+--- a/src/stream_outlet_impl.h	2026-08-04 10:25:08
++++ b/src/stream_outlet_impl.h	2026-08-25 16:54:47
+@@ -226,6 +226,23 @@
+ 			LOG_F(WARNING, "Unexpected error during push_chunk: %s", e.what());
+ 			return lsl_internal_error;
+ 		}
++	}
++
++	// Tag dispatch standing in for `if constexpr`: it keeps
++	// enqueue_chunk_sync<std::string> from ever being instantiated, which is what
++	// the C++17 form was there for, but compiles on C++11 front-ends (GCC 6).
++	template <class T>
++	bool try_enqueue_chunk_sync(const T *buffer, std::size_t num_samples, double timestamp,
++		bool pushthrough, std::false_type /*is_string*/) {
++		if (sync_mode_) {
++			enqueue_chunk_sync(buffer, num_samples, timestamp, pushthrough);
++			return true;
++		}
++		return false;
++	}
++	bool try_enqueue_chunk_sync(
++		const std::string *, std::size_t, double, bool, std::true_type /*is_string*/) {
++		return false;
+ 	}
+ 
+ 	/**
+@@ -261,12 +278,9 @@
+ 			// Use optimized sync path for non-string types in sync mode. Sync mode always
+ 			// sends immediately, so pushthrough is ignored (the whole chunk is one blocking
+ 			// gather-write). if constexpr prevents instantiation of enqueue_chunk_sync<std::string>.
+-			if constexpr (!std::is_same<T, std::string>::value) {
+-				if (sync_mode_) {
+-					enqueue_chunk_sync(buffer, num_samples, timestamp, pushthrough);
+-					return;
+-				}
+-			}
++			if (try_enqueue_chunk_sync(
++					buffer, num_samples, timestamp, pushthrough, std::is_same<T, std::string>()))
++				return;
+ 			// Async path (or string types which don't support sync mode)
+ 			push_sample(buffer, timestamp, pushthrough && (num_samples == 1));
+ 			for (std::size_t k = 1; k < num_samples; k++)

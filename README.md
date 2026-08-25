@@ -63,6 +63,9 @@ lsl_api.cfg                       liblsl config; set KnownPeers before a session
 docs/flutter_outlet_spec.md       the iPad-side contract
 analysis/analyse_session.py       computes T1-T4 and the theta bracket
 analysis/make_synthetic_session.py  known-ground-truth fixture for the above
+cross/build_liblsl.sh             cross-compiles liblsl for armhf into lib/
+cross/bela-armhf.cmake            CMake toolchain file for the Bela target
+cross/gcc6-compat.patch           C++17 constructs the Bela's gcc 6.3 lacks
 render_lsl.cpp.orig               previous prototypes, kept for reference;
 render_no_lsl.cpp.orig              the .orig suffix keeps them out of the build
 ```
@@ -77,6 +80,25 @@ one.
 ```
 
 Requires the cross-toolchain and sysroot from `SyncBelaSysroot.sh`.
+
+### Rebuilding liblsl
+
+`lib/liblsl.so` is built on the host with the same toolchain -- nothing is
+installed on the board:
+
+```sh
+cross/build_liblsl.sh [path-to-liblsl-source] [--install]
+```
+
+It stages a copy of the source, applies `cross/gcc6-compat.patch` (the Bela
+toolchain's gcc 6.3.1 is a C++11/14 front-end and rejects three C++17 constructs
+liblsl 1.17 uses: `inline` static data members, `if constexpr`, and
+`std::string_view`), builds, strips, and with `--install` copies the library and
+its public headers into `lib/` and `include/`. The source tree itself is never
+modified.
+
+The library carries `SONAME liblsl.so.2`, so it is installed under both names
+and `build.sh` puts `lib/` on the executable's rpath.
 
 ## Output
 
