@@ -44,13 +44,15 @@
 // ---------------------------------------------------------------------------
 
 #define ENABLE_LSL 1 // 0 = pins-only mode (replaces render_no_lsl.cpp)
-#define USE_OLED_DISPLAY 1
+#define USE_OLED_DISPLAY 0
 
 #if ENABLE_LSL
 #include <include/lsl_cpp.h>
 #endif
 
+#if USE_OLED_DISPLAY
 static const int kOledI2cDev = 1;
+#endif
 
 // Digital sensor inputs. `active_level` is the logic level that means "the
 // sensor is asserted" -- the comparator front-ends are opposite polarity.
