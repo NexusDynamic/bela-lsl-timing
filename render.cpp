@@ -455,35 +455,41 @@ void clockSyncTask(void*) {
     }
 }
 
-// One-shot survey of every digital pin, run on the first render() block.
-// digitalRead() is only meaningful once the audio thread has sampled a block,
-// so this cannot live in setup(). Pins 0-11 are the cape's digital inputs;
-// 12-15 are wired to the stereo digital outputs and are unused here, but they
-// are reported too so a mis-wired connector shows up as "the signal is on a
-// pin I am not watching".
-static void scanAllDigitalPins(BelaContext* context) {
-    const unsigned int nPins =
-        context->digitalChannels < 16 ? context->digitalChannels : 16;
+// Survey of every digital pin over the first 100 ms of running, reported once.
+// digitalRead() is only meaningful once the audio thread has sampled a block, so
+// this cannot live in setup(); and one block is 16 frames (0.33 ms), which is far
+// too short a window to tell an idle level from a signal, and is also the block
+// most likely to be garbage if the PRU has not settled. Pins 0-11 are the cape's
+// digital inputs; 12-15 are wired to the stereo digital outputs and are unused
+// here, but they are reported too, so a signal on a pin nobody is watching shows
+// up as such instead of looking like a dead sensor.
+static const unsigned int kScanFrames = 4800; // 100 ms at 44.1-48 kHz
 
-    rt_printf("--- initial digital pin scan (%u frames of block 0) ---\n",
-              context->digitalFrames);
-    rt_printf("pin  state  high%%  edges  role\n");
+struct PinScan {
+    unsigned int high_frames;
+    unsigned int edges;
+    bool first_state;
+    bool prev_state;
+};
+
+static PinScan gScan[16];
+static unsigned int gScanFrames = 0;
+static unsigned int gScanBlocks = 0;
+static bool gScanDone = false;
+
+static void reportDigitalPinScan(BelaContext* context, unsigned int nPins) {
+    rt_printf("--- digital pin scan: %u frames (%.1f ms) over %u blocks ---\n",
+              gScanFrames, 1000.0 * gScanFrames / context->digitalSampleRate,
+              gScanBlocks);
+    rt_printf("pin  first  now   high%%  edges  role\n");
+
+    unsigned int totalEdges = 0;
+    unsigned int totalHigh = 0;
 
     for (unsigned int pin = 0; pin < nPins; pin++) {
-        const bool first = digitalRead(context, 0, pin);
-        bool prev = first;
-        unsigned int highFrames = first ? 1 : 0;
-        unsigned int edges = 0;
-
-        for (unsigned int n = 1; n < context->digitalFrames; n++) {
-            const bool state = digitalRead(context, n, pin);
-            if (state)
-                highFrames++;
-            if (state != prev) {
-                edges++;
-                prev = state;
-            }
-        }
+        const PinScan& c = gScan[pin];
+        totalEdges += c.edges;
+        totalHigh += c.high_frames;
 
         const char* role = "(unwatched)";
         for (size_t p = 0; p < kNumSensorPins; p++) {
@@ -495,10 +501,74 @@ static void scanAllDigitalPins(BelaContext* context) {
         if (pin >= 12 && role[0] == '(')
             role = "(digital out, unused)";
 
-        rt_printf("%3u  %-5s  %5u  %5u  %s\n", pin, first ? "HIGH" : "LOW",
-                  (100 * highFrames) / context->digitalFrames, edges, role);
+        rt_printf("%3u  %-5s  %-5s %5u  %5u  %s\n", pin,
+                  c.first_state ? "HIGH" : "LOW", c.prev_state ? "HIGH" : "LOW",
+                  (100 * c.high_frames) / gScanFrames, c.edges, role);
+    }
+
+    // Every pin reading a flat zero for 100 ms is far more likely to mean the PRU
+    // never filled the digital buffer than to mean every input really is grounded
+    // -- an unconnected Bela input floats and an idle active-LOW comparator sits
+    // HIGH, so a true all-LOW reading takes deliberate wiring.
+    if (totalHigh == 0 && totalEdges == 0) {
+        rt_printf("*** All %u pins read LOW for the whole window with no edges. "
+                  "That is the signature of a\n",
+                  nPins);
+        rt_printf("*** digital buffer the PRU never wrote, not of a wiring "
+                  "fault. Check for 'PRU interrupt\n");
+        rt_printf("*** timeout' or 'McASP error' above before reading anything "
+                  "into these levels.\n");
     }
     rt_printf("--- end pin scan ---\n");
+}
+
+// Accumulate one block into the scan; prints and latches off once the window is
+// full. Called every block until then.
+static void updateDigitalPinScan(BelaContext* context) {
+    if (gScanDone)
+        return;
+
+    const unsigned int nPins =
+        context->digitalChannels < 16 ? context->digitalChannels : 16;
+
+    if (nPins == 0 || context->digitalFrames == 0) {
+        gScanDone = true;
+        rt_printf("*** NO DIGITAL I/O: digitalChannels=%u digitalFrames=%u "
+                  "digitalSampleRate=%.0f\n",
+                  context->digitalChannels, context->digitalFrames,
+                  context->digitalSampleRate);
+        rt_printf("*** digitalRead() cannot return anything and no edge will "
+                  "ever be logged. Run line needs --use-digital 1.\n");
+        return;
+    }
+
+    for (unsigned int n = 0; n < context->digitalFrames; n++) {
+        for (unsigned int pin = 0; pin < nPins; pin++) {
+            const bool state = digitalRead(context, n, pin);
+            PinScan& c = gScan[pin];
+
+            if (gScanFrames == 0) {
+                c.first_state = state;
+                c.prev_state = state;
+                c.high_frames = 0;
+                c.edges = 0;
+            } else if (state != c.prev_state) {
+                c.edges++;
+                c.prev_state = state;
+            }
+            if (state)
+                c.high_frames++;
+        }
+        gScanFrames++;
+        if (gScanFrames >= kScanFrames)
+            break;
+    }
+    gScanBlocks++;
+
+    if (gScanFrames >= kScanFrames) {
+        gScanDone = true;
+        reportDigitalPinScan(context, nPins);
+    }
 }
 
 void render(BelaContext* context, void* userData) {
@@ -515,7 +585,6 @@ void render(BelaContext* context, void* userData) {
     if (sFirstBlock) {
         sFirstBlock = false;
         sLastUnderrunCount = context->underrunCount;
-        scanAllDigitalPins(context);
     } else {
         if (blockStart != sExpectedFrame) {
             pushStatusRT(ST_BLOCK_GAP, blockStart,
@@ -529,6 +598,8 @@ void render(BelaContext* context, void* userData) {
         }
     }
     sExpectedFrame = blockEnd;
+
+    updateDigitalPinScan(context);
 
     // Re-assert input direction every block. Pins default to INPUT and the
     // setting persists, so this is normally a no-op -- but it costs a handful
@@ -1262,16 +1333,13 @@ static std::thread gLslThread;
 
 bool setup(BelaContext* context, void* userData) {
 #if ENABLE_LSL
-    rt_printf("liblsl %d.%d (protocol %d, headers %d)\n",
+    // These three are independent counters, not a matched set: library_version()
+    // tracks releases, protocol_version() has been pinned at 110 since liblsl
+    // 1.10, and LIBLSL_COMPILE_HEADER_VERSION is a header feature level. Report
+    // them into the session metadata and leave the judgement to the analysis.
+    rt_printf("liblsl %d.%d (wire protocol %d, headers %d)\n",
               lsl::library_version() / 100, lsl::library_version() % 100,
               lsl::protocol_version(), LIBLSL_COMPILE_HEADER_VERSION);
-    if (lsl::protocol_version() != LIBLSL_COMPILE_HEADER_VERSION) {
-        rt_printf(
-            "WARNING: liblsl binary protocol %d != compiled headers %d. "
-            "Rebuild "
-            "or re-sync include/ and lib/liblsl.so before trusting timings.\n",
-            lsl::protocol_version(), LIBLSL_COMPILE_HEADER_VERSION);
-    }
 #else
     rt_printf("Pins-only mode (ENABLE_LSL=0)\n");
 #endif
@@ -1279,6 +1347,21 @@ bool setup(BelaContext* context, void* userData) {
     if (!makeSessionDir())
         return false;
     rt_printf("Session: %s\n", gSessionDir.c_str());
+
+    // Every measurement this program makes comes from a digital edge, so a run
+    // without digital I/O produces an empty edges.csv and nothing says why.
+    // The usual cause is the run line: Bela parses --use-digital with atoi(),
+    // so the plausible-looking "--use-digital yes" evaluates to 0 and silently
+    // turns the pins off (as does "--digital-channels 0").
+    if (context->digitalChannels == 0 || context->digitalFrames == 0) {
+        rt_printf("Error: no digital I/O (channels=%u frames=%u rate=%.0f Hz).\n",
+                  context->digitalChannels, context->digitalFrames,
+                  context->digitalSampleRate);
+        rt_printf("       The run line needs --use-digital 1 and "
+                  "--digital-channels 16; note that these take a NUMBER, and "
+                  "\"yes\" parses as 0.\n");
+        return false;
+    }
 
     for (size_t i = 0; i < kNumSensorPins; i++) {
         pinMode(context, 0, kSensorPins[i].pin, INPUT);

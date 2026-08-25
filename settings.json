@@ -32,7 +32,7 @@
     "-I5,": "0",
     "-I6,": "0",
     "-I7,": "0",
-    "user": "--high-performance-mode --board Bela ",
+    "user": "--high-performance-mode ",
     "make": "CPPFLAGS='-std=c++1z -I/root/Bela/projects/bela-lsl-timing/include' LDLIBS=/root/Bela/projects/bela-lsl-timing/lib/liblsl.so",
     "-X": "0",
     "audioExpander": "0",
