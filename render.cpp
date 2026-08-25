@@ -455,6 +455,52 @@ void clockSyncTask(void*) {
     }
 }
 
+// One-shot survey of every digital pin, run on the first render() block.
+// digitalRead() is only meaningful once the audio thread has sampled a block,
+// so this cannot live in setup(). Pins 0-11 are the cape's digital inputs;
+// 12-15 are wired to the stereo digital outputs and are unused here, but they
+// are reported too so a mis-wired connector shows up as "the signal is on a
+// pin I am not watching".
+static void scanAllDigitalPins(BelaContext* context) {
+    const unsigned int nPins =
+        context->digitalChannels < 16 ? context->digitalChannels : 16;
+
+    rt_printf("--- initial digital pin scan (%u frames of block 0) ---\n",
+              context->digitalFrames);
+    rt_printf("pin  state  high%%  edges  role\n");
+
+    for (unsigned int pin = 0; pin < nPins; pin++) {
+        const bool first = digitalRead(context, 0, pin);
+        bool prev = first;
+        unsigned int highFrames = first ? 1 : 0;
+        unsigned int edges = 0;
+
+        for (unsigned int n = 1; n < context->digitalFrames; n++) {
+            const bool state = digitalRead(context, n, pin);
+            if (state)
+                highFrames++;
+            if (state != prev) {
+                edges++;
+                prev = state;
+            }
+        }
+
+        const char* role = "(unwatched)";
+        for (size_t p = 0; p < kNumSensorPins; p++) {
+            if (kSensorPins[p].pin == pin) {
+                role = kSensorPins[p].role;
+                break;
+            }
+        }
+        if (pin >= 12 && role[0] == '(')
+            role = "(digital out, unused)";
+
+        rt_printf("%3u  %-5s  %5u  %5u  %s\n", pin, first ? "HIGH" : "LOW",
+                  (100 * highFrames) / context->digitalFrames, edges, role);
+    }
+    rt_printf("--- end pin scan ---\n");
+}
+
 void render(BelaContext* context, void* userData) {
     const uint64_t blockStart = context->audioFramesElapsed;
     const uint64_t blockEnd = blockStart + context->audioFrames;
@@ -469,6 +515,7 @@ void render(BelaContext* context, void* userData) {
     if (sFirstBlock) {
         sFirstBlock = false;
         sLastUnderrunCount = context->underrunCount;
+        scanAllDigitalPins(context);
     } else {
         if (blockStart != sExpectedFrame) {
             pushStatusRT(ST_BLOCK_GAP, blockStart,
