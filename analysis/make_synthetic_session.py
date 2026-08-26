@@ -5,12 +5,17 @@ format and analyse_session.py without hardware.
     python3 analysis/make_synthetic_session.py logs/SYNTH_test
     python3 analysis/analyse_session.py       logs/SYNTH_test
 
+An optional second argument sets the digital sample rate (default 48000, what a
+CTAG cape reports; a plain Bela cape runs at 44100):
+
+    python3 analysis/make_synthetic_session.py logs/SYNTH_44k 44100
+
 Recovered values should match the GROUND TRUTH line this prints.
 """
 import json, os, sys
 import numpy as np
 
-FS = 44100.0
+FS = 48000.0
 SLOPE = (1.0 / FS) * (1 + 23e-6)   # 23 ppm audio-clock error
 INTERCEPT = 5000.0                 # Bela local_clock at frame 0
 THETA = 12.3456                    # true (Bela - iPad) offset, s
@@ -20,7 +25,10 @@ CORR_DRIFT_PPM = 8.0
 N = 60
 
 
-def main(d: str):
+def main(d: str, fs: float = FS):
+    global FS, SLOPE
+    FS = fs
+    SLOPE = (1.0 / FS) * (1 + 23e-6)
     rng = np.random.default_rng(7)
     os.makedirs(d, exist_ok=True)
     stem = os.path.basename(d.rstrip("/"))
@@ -90,7 +98,8 @@ def main(d: str):
 
     json.dump({"session": stem, "schema_version": 1, "lsl_enabled": True,
                "start_wall_iso_utc": "2026-08-24T14:30:00Z",
-               "digital_sample_rate": 44100.0,
+               "digital_sample_rate": FS,
+               "resolved_sample_rate": FS,
                "files": {"edges": f"{stem}_edges.csv", "status": f"{stem}_status.csv",
                          "sync": f"{stem}_sync.csv", "lsl": f"{stem}_lsl.csv",
                          "timecorr": f"{stem}_timecorr.csv"}},
@@ -106,4 +115,5 @@ def main(d: str):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "logs/SYNTH_test")
+    main(sys.argv[1] if len(sys.argv) > 1 else "logs/SYNTH_test",
+         float(sys.argv[2]) if len(sys.argv) > 2 else FS)

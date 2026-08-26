@@ -55,19 +55,21 @@ static const int kOledI2cDev = 1;
 #endif
 
 // Digital sensor inputs. `active_level` is the logic level that means "the
-// sensor is asserted" -- the comparator front-ends are opposite polarity.
-// `refractory_frames` only drives the `accepted` flag in the log; no edge is
-// ever discarded because of it (see the burst guard in render()).
+// sensor is asserted". `refractory_ms` only drives the `accepted` flag in the
+// log; no edge is ever discarded because of it (see the burst guard in
+// render()). It is a duration, not a frame count, so it means the same thing
+// whatever rate the board comes up at -- gRefractoryFrames[] below holds the
+// conversion, done once in setup() against the real digital sample rate.
 struct SensorPin {
     unsigned int pin;
     const char* role;
     bool active_level;
-    unsigned int refractory_frames;
+    double refractory_ms;
 };
 
 static const SensorPin kSensorPins[] = {
-    {0, "fsr", true, 44},        // ~1 ms at 44.1 kHz
-    {1, "photodiode", true, 44}, // active-Hight comparator
+    {0, "fsr", true, 1.0},
+    {1, "photodiode", true, 1.0}, // active-HIGH comparator
 };
 static const size_t kNumSensorPins =
     sizeof(kSensorPins) / sizeof(kSensorPins[0]);
@@ -94,10 +96,21 @@ static const int32_t kInletChunkLen = 1; // no chunking: minimum latency
 static const bool kInletRecover = true;
 #endif
 
-static const unsigned int kNominalFs = 44100;
+// Fallback only, for the window in which context->digitalSampleRate has not
+// been read yet; setup() overwrites gSampleRate with what the board reports.
+// Bela runs at 44100 on most capes and 48000 on the CTAG ones, so nothing here
+// may assume either.
+static const double kFallbackFs = 44100.0;
 static const unsigned int kPeriodSize = 16;
 static const size_t kMaxChannels = 8;
 static const size_t kMaxIdLen = 64;
+
+// Resolved once in setup() from context->digitalSampleRate, then read-only for
+// the rest of the run, so no synchronisation is needed: setup() completes
+// before render() or any worker thread starts.
+static double gSampleRate = kFallbackFs;
+static uint64_t gRefractoryFrames[16];
+static unsigned int gSyncPeriodBlocks = 1;
 
 // Queue depths. Drained every 20 ms by the logger thread.
 static const size_t kEdgeQueueSize = 16384;
@@ -649,8 +662,8 @@ void render(BelaContext* context, void* userData) {
                 states &= ~(1 << p);
             statesChanged = true;
 
-            const bool accepted = (frame - s.last_accepted_frame) >=
-                                  kSensorPins[p].refractory_frames;
+            const bool accepted =
+                (frame - s.last_accepted_frame) >= gRefractoryFrames[p];
             if (accepted) {
                 s.last_accepted_frame = frame;
                 s.burst_count = 0;
@@ -697,8 +710,7 @@ void render(BelaContext* context, void* userData) {
     renderCount++;
 
     // Clock-sync pairs every ~200 ms.
-    static const unsigned int kSyncPeriodBlocks = kNominalFs / kPeriodSize / 5;
-    if (renderCount % kSyncPeriodBlocks == 0) {
+    if (renderCount % gSyncPeriodBlocks == 0) {
         gSyncRequestFrame.store(blockEnd, std::memory_order_relaxed);
         Bela_scheduleAuxiliaryTask(gClockSyncTask);
     }
@@ -1042,7 +1054,7 @@ static bool drainQueues() {
                        gStats.awaitingEnd) {
                 gStats.lastT1Ms =
                     1000.0 * static_cast<double>(ee.frame - gStats.startFrame) /
-                    static_cast<double>(kNominalFs);
+                    gSampleRate;
                 gStats.trials++;
                 gStats.awaitingEnd = false;
             }
@@ -1276,7 +1288,11 @@ static void writeMetaJson(BelaContext* context) {
     f << "  \"digital_sample_rate\": " << context->digitalSampleRate << ",\n";
     f << "  \"audio_frames_per_block\": " << context->audioFrames << ",\n";
     f << "  \"digital_frames_per_block\": " << context->digitalFrames << ",\n";
-    f << "  \"nominal_fs_assumed\": " << kNominalFs << ",\n";
+    // The rate every frame->seconds conversion in this run was done with. It
+    // tracks digital_sample_rate except in the degenerate case where the board
+    // reported nothing and the fallback was used.
+    f << "  \"resolved_sample_rate\": " << gSampleRate << ",\n";
+    f << "  \"sync_period_blocks\": " << gSyncPeriodBlocks << ",\n";
     f << "  \"project_name\": \"" << context->projectName << "\",\n";
 
 #if ENABLE_LSL
@@ -1303,8 +1319,8 @@ static void writeMetaJson(BelaContext* context) {
         f << "    {\"index\": " << i << ", \"pin\": " << kSensorPins[i].pin
           << ", \"role\": \"" << kSensorPins[i].role
           << "\", \"active_level\": " << (kSensorPins[i].active_level ? 1 : 0)
-          << ", \"refractory_frames\": " << kSensorPins[i].refractory_frames
-          << "}";
+          << ", \"refractory_ms\": " << kSensorPins[i].refractory_ms
+          << ", \"refractory_frames\": " << gRefractoryFrames[i] << "}";
         if (i + 1 < kNumSensorPins)
             f << ",";
         f << "\n";
@@ -1367,12 +1383,37 @@ bool setup(BelaContext* context, void* userData) {
         return false;
     }
 
+    // Resolve everything rate-dependent from what the board actually reports.
+    // A CTAG cape brings the McASP up at 48 kHz where a plain Bela cape runs at
+    // 44.1 kHz, and a frame count baked in at one rate is silently wrong at the
+    // other.
+    gSampleRate = context->digitalSampleRate;
+    if (!(gSampleRate > 0.0)) {
+        rt_printf("Warning: digitalSampleRate is %.0f; assuming %.0f Hz.\n",
+                  context->digitalSampleRate, kFallbackFs);
+        gSampleRate = kFallbackFs;
+    }
+
+    // Clock-sync pairs every ~200 ms, expressed in render() blocks.
+    gSyncPeriodBlocks = static_cast<unsigned int>(
+        (gSampleRate / static_cast<double>(context->audioFrames)) / 5.0 + 0.5);
+    if (gSyncPeriodBlocks < 1)
+        gSyncPeriodBlocks = 1;
+
+    rt_printf("Digital rate %.0f Hz; clock-sync every %u blocks (%.0f ms).\n",
+              gSampleRate, gSyncPeriodBlocks,
+              1000.0 * gSyncPeriodBlocks * context->audioFrames / gSampleRate);
+
     for (size_t i = 0; i < kNumSensorPins; i++) {
         pinMode(context, 0, kSensorPins[i].pin, INPUT);
-        rt_printf("  pin %2u  role=%-12s active=%s  refractory=%u frames\n",
-                  kSensorPins[i].pin, kSensorPins[i].role,
-                  kSensorPins[i].active_level ? "HIGH" : "LOW",
-                  kSensorPins[i].refractory_frames);
+        gRefractoryFrames[i] = static_cast<uint64_t>(
+            kSensorPins[i].refractory_ms * gSampleRate / 1000.0 + 0.5);
+        rt_printf(
+            "  pin %2u  role=%-12s active=%s  refractory=%.3f ms (%llu frames)\n",
+            kSensorPins[i].pin, kSensorPins[i].role,
+            kSensorPins[i].active_level ? "HIGH" : "LOW",
+            kSensorPins[i].refractory_ms,
+            static_cast<unsigned long long>(gRefractoryFrames[i]));
     }
 
 #if USE_OLED_DISPLAY

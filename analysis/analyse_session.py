@@ -47,7 +47,7 @@ def load(session: Path):
     return out
 
 
-def fit_frame_to_clock(sync: pd.DataFrame):
+def fit_frame_to_clock(sync: pd.DataFrame, fs: float):
     """Fit lsl_clock ~ frame using only tightly-bracketed sync pairs.
 
     bracket_frames upper-bounds how stale the frame counter was when the clock
@@ -67,12 +67,12 @@ def fit_frame_to_clock(sync: pd.DataFrame):
     slope, intercept = np.polyfit(x, y, 1)
     resid = y - (slope * x + intercept)
 
-    nominal = 1.0 / 44100.0
+    nominal = 1.0 / fs
     print("Frame -> LSL clock map")
     print(f"  sync rows            : {len(sync)} ({len(tight)} used, "
           f"bracket <= {cutoff:.0f} frames)")
     print(f"  fitted frame period  : {slope*1e9:.4f} ns "
-          f"({(slope/nominal - 1)*1e6:+.1f} ppm vs 44100 Hz)")
+          f"({(slope/nominal - 1)*1e6:+.1f} ppm vs {fs:.0f} Hz)")
     print(f"  residual std / max   : {resid.std()*1e6:.1f} us / "
           f"{np.abs(resid).max()*1e6:.1f} us")
     if resid.std() > 1e-3:
@@ -109,8 +109,21 @@ def main(session: Path):
     edges, sync = d.get("edges"), d.get("sync")
     lsl, corr, status = d.get("lsl"), d.get("timecorr"), d.get("status")
 
+    # The rig writes resolved_sample_rate (what render.cpp actually converted
+    # with); digital_sample_rate is the same value from Bela and is the fallback
+    # for sessions recorded before that field existed. Nothing is assumed: a
+    # session missing both cannot be converted to seconds at all.
+    fs = meta.get("resolved_sample_rate") or meta.get("digital_sample_rate")
+    if not fs:
+        raise SystemExit(
+            "Session metadata has neither resolved_sample_rate nor "
+            "digital_sample_rate; cannot convert frames to seconds."
+        )
+    fs = float(fs)
+
     print(f"Session {meta['session']}  (LSL {'on' if meta['lsl_enabled'] else 'off'})")
-    print(f"  started {meta['start_wall_iso_utc']}\n")
+    print(f"  started {meta['start_wall_iso_utc']}")
+    print(f"  digital rate {fs:.0f} Hz\n")
 
     # ---- data integrity first: nothing below is trustworthy without this ----
     print("Integrity")
@@ -125,14 +138,12 @@ def main(session: Path):
             print(f"  dropped events       : {int(end.detail_num.iloc[-1])}")
     print()
 
-    slope, intercept = fit_frame_to_clock(sync)
+    slope, intercept = fit_frame_to_clock(sync, fs)
     print()
 
     # ---- T1: the gold standard, no cross-device clock involved -------------
     fsr = sensor_events(edges, "fsr")
     photo = sensor_events(edges, "photodiode")
-    fs = float(meta.get("digital_sample_rate") or 44100.0)
-
     t1, t1_fsr, t1_photo = [], [], []
     window = T1_WINDOW_S * fs
     used = set()
