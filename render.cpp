@@ -66,8 +66,8 @@ struct SensorPin {
 };
 
 static const SensorPin kSensorPins[] = {
-    {0, "fsr", true, 44},         // ~1 ms at 44.1 kHz
-    {1, "photodiode", false, 44}, // active-LOW comparator
+    {0, "fsr", true, 44},        // ~1 ms at 44.1 kHz
+    {1, "photodiode", true, 44}, // active-Hight comparator
 };
 static const size_t kNumSensorPins =
     sizeof(kSensorPins) / sizeof(kSensorPins[0]);
@@ -456,13 +456,13 @@ void clockSyncTask(void*) {
 }
 
 // Survey of every digital pin over the first 100 ms of running, reported once.
-// digitalRead() is only meaningful once the audio thread has sampled a block, so
-// this cannot live in setup(); and one block is 16 frames (0.33 ms), which is far
-// too short a window to tell an idle level from a signal, and is also the block
-// most likely to be garbage if the PRU has not settled. Pins 0-11 are the cape's
-// digital inputs; 12-15 are wired to the stereo digital outputs and are unused
-// here, but they are reported too, so a signal on a pin nobody is watching shows
-// up as such instead of looking like a dead sensor.
+// digitalRead() is only meaningful once the audio thread has sampled a block,
+// so this cannot live in setup(); and one block is 16 frames (0.33 ms), which
+// is far too short a window to tell an idle level from a signal, and is also
+// the block most likely to be garbage if the PRU has not settled. Pins 0-11 are
+// the cape's digital inputs; 12-15 are wired to the stereo digital outputs and
+// are unused here, but they are reported too, so a signal on a pin nobody is
+// watching shows up as such instead of looking like a dead sensor.
 static const unsigned int kScanFrames = 4800; // 100 ms at 44.1-48 kHz
 
 struct PinScan {
@@ -506,14 +506,16 @@ static void reportDigitalPinScan(BelaContext* context, unsigned int nPins) {
                   (100 * c.high_frames) / gScanFrames, c.edges, role);
     }
 
-    // Every pin reading a flat zero for 100 ms is far more likely to mean the PRU
-    // never filled the digital buffer than to mean every input really is grounded
-    // -- an unconnected Bela input floats and an idle active-LOW comparator sits
-    // HIGH, so a true all-LOW reading takes deliberate wiring.
+    // Every pin reading a flat zero for 100 ms is far more likely to mean the
+    // PRU never filled the digital buffer than to mean every input really is
+    // grounded
+    // -- an unconnected Bela input floats and an idle active-LOW comparator
+    // sits HIGH, so a true all-LOW reading takes deliberate wiring.
     if (totalHigh == 0 && totalEdges == 0) {
-        rt_printf("*** All %u pins read LOW for the whole window with no edges. "
-                  "That is the signature of a\n",
-                  nPins);
+        rt_printf(
+            "*** All %u pins read LOW for the whole window with no edges. "
+            "That is the signature of a\n",
+            nPins);
         rt_printf("*** digital buffer the PRU never wrote, not of a wiring "
                   "fault. Check for 'PRU interrupt\n");
         rt_printf("*** timeout' or 'McASP error' above before reading anything "
@@ -1333,10 +1335,11 @@ static std::thread gLslThread;
 
 bool setup(BelaContext* context, void* userData) {
 #if ENABLE_LSL
-    // These three are independent counters, not a matched set: library_version()
-    // tracks releases, protocol_version() has been pinned at 110 since liblsl
-    // 1.10, and LIBLSL_COMPILE_HEADER_VERSION is a header feature level. Report
-    // them into the session metadata and leave the judgement to the analysis.
+    // These three are independent counters, not a matched set:
+    // library_version() tracks releases, protocol_version() has been pinned at
+    // 110 since liblsl 1.10, and LIBLSL_COMPILE_HEADER_VERSION is a header
+    // feature level. Report them into the session metadata and leave the
+    // judgement to the analysis.
     rt_printf("liblsl %d.%d (wire protocol %d, headers %d)\n",
               lsl::library_version() / 100, lsl::library_version() % 100,
               lsl::protocol_version(), LIBLSL_COMPILE_HEADER_VERSION);
@@ -1354,9 +1357,10 @@ bool setup(BelaContext* context, void* userData) {
     // so the plausible-looking "--use-digital yes" evaluates to 0 and silently
     // turns the pins off (as does "--digital-channels 0").
     if (context->digitalChannels == 0 || context->digitalFrames == 0) {
-        rt_printf("Error: no digital I/O (channels=%u frames=%u rate=%.0f Hz).\n",
-                  context->digitalChannels, context->digitalFrames,
-                  context->digitalSampleRate);
+        rt_printf(
+            "Error: no digital I/O (channels=%u frames=%u rate=%.0f Hz).\n",
+            context->digitalChannels, context->digitalFrames,
+            context->digitalSampleRate);
         rt_printf("       The run line needs --use-digital 1 and "
                   "--digital-channels 16; note that these take a NUMBER, and "
                   "\"yes\" parses as 0.\n");
