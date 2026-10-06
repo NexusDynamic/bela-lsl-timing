@@ -5,12 +5,19 @@
 
 Computes:
   T1  motor -> photon     = t_photodiode - t_fsr          (Bela frames only)
-  T2  touch -> OS report  = (touch_clock + theta) - t_fsr
-  T3  OS report -> photon = t_photodiode - (touch_clock + theta)
+  T2  touch -> handler    = (handler_clock + theta) - t_fsr
+      T2a touch -> OS timestamp   = (os_touch_clock + theta) - t_fsr
+      T2b OS timestamp -> handler = handler_clock - os_touch_clock   (iPad clock only)
+  T3  handler -> photon   = t_photodiode - (handler_clock + theta)
   T4  LSL one-way         = arrival - (sender_ts + correction)
 
-plus an LSL-independent bracket on the clock offset theta, from the physical
-constraints T2 >= 0 and T3 >= D_MIN, as a cross-check on time_correction.
+handler_clock is ch1 of a TOUCH_REGISTERED sample: when the Dart handler
+observed the touch. os_touch_clock is ch4: the OS's own timestamp for it
+(PointerEvent.timeStamp). T2a/T2b are only reported when ch4 is present.
+
+Also checks time_correction against physics, without trusting LSL: the handler
+cannot run before the finger lands (T2 >= 0) and the flash cannot appear sooner
+than D_MIN after it (T3 >= D_MIN). Together they bracket how wrong theta can be.
 """
 
 import json
@@ -32,6 +39,11 @@ FLASH_PRESENTED = 4
 # A motor->photon latency beyond this would be pathological; keeping it tight is
 # what stops a false FSR trigger from being matched to the next trial's flash.
 T1_WINDOW_S = 0.30
+
+# FSR edges closer together than this are one press: the sensor often trips,
+# releases and trips again as the finger settles (seen 13-25 ms apart, well past
+# the 1 ms refractory). The press began at the first edge of such a burst.
+FSR_BOUNCE_S = 0.05
 
 # Max gap when matching an LSL touch event to its FSR edge, after the touch has
 # been mapped into Bela time.
@@ -146,19 +158,31 @@ def main(session: Path):
     photo = sensor_events(edges, "photodiode")
     t1, t1_fsr, t1_photo = [], [], []
     window = T1_WINDOW_S * fs
+    bounce = FSR_BOUNCE_S * fs
     used = set()
+    n_bounced = 0
     for p_ in photo:
         prev = fsr[(fsr < p_) & (p_ - fsr <= window)]
         if prev.size:
-            f = prev[-1]              # nearest preceding FSR edge
+            # Start from the nearest preceding FSR edge and walk back to the
+            # first edge of its burst: a bounce is the same press, and pairing
+            # with its last edge would date the touch after the OS reported it.
+            k = prev.size - 1
+            while k > 0 and prev[k] - prev[k - 1] <= bounce:
+                k -= 1
+            n_bounced += k < prev.size - 1
+            f = prev[k]
             t1.append((p_ - f) / fs)
             t1_fsr.append(f)
             t1_photo.append(p_)
-            used.add(int(f))
+            used.update(int(v) for v in prev[k:])
 
     print("T1  motor -> photon   (Bela hardware clock only)")
     report_stat("t_photo - t_fsr", t1)
     print(f"  FSR edges={fsr.size}  photodiode edges={photo.size}  paired={len(t1)}")
+    if n_bounced:
+        print(f"  FSR bounces          : {n_bounced} press(es) tripped the FSR more than "
+              f"once; timed from the first edge")
     if fsr.size:
         unpaired = fsr.size - len(used)
         print(f"  unpaired FSR edges   : {unpaired} "
@@ -207,20 +231,27 @@ def main(session: Path):
         print("No TOUCH_REGISTERED events; T2/T3 unavailable.")
         return
 
-    touch_clock = touch.ch1.to_numpy()          # iPad clock
+    handler_clock = touch.ch1.to_numpy()        # iPad clock: Dart handler ran
+    # ch4 is the OS's own timestamp for the touch. Sessions recorded before the
+    # outlet sent it (and the synthetic fixture) leave it absent, NaN or 0.
+    if "ch4" in touch.columns:
+        os_clock = touch.ch4.to_numpy(dtype=float)
+        os_clock = np.where(np.isfinite(os_clock) & (os_clock > 0), os_clock, np.nan)
+    else:
+        os_clock = np.full(len(touch), np.nan)
     # Interpolate the correction at the row's own arrival time, which is already
     # on the Bela clock -- interpolating at an iPad-clock value would index the
     # series by the wrong axis.
     touch_theta = np.interp(touch.arrival_lsl_clock.to_numpy(),
                             corr_ok.lsl_clock.to_numpy(),
                             corr_ok.correction.to_numpy())
-    touch_bela = touch_clock + touch_theta      # mapped into Bela time
+    handler_bela = handler_clock + touch_theta  # mapped into Bela time
 
     fsr_clock = frames_to_clock(t1_fsr, slope, intercept)
     photo_clock = frames_to_clock(t1_photo, slope, intercept)
 
-    pair_f, pair_p, pair_t, pair_th = [], [], [], []
-    for tb, tc, th in zip(touch_bela, touch_clock, touch_theta):
+    pair_f, pair_p, pair_t, pair_o, pair_th = [], [], [], [], []
+    for tb, tc, oc, th in zip(handler_bela, handler_clock, os_clock, touch_theta):
         if not len(fsr_clock):
             break
         j = int(np.argmin(np.abs(fsr_clock - tb)))
@@ -228,33 +259,54 @@ def main(session: Path):
             pair_f.append(fsr_clock[j])
             pair_p.append(photo_clock[j])
             pair_t.append(tc)
+            pair_o.append(oc)
             pair_th.append(th)
     pair_f = np.array(pair_f); pair_p = np.array(pair_p)
-    pair_t = np.array(pair_t); pair_th = np.array(pair_th)
+    pair_t = np.array(pair_t); pair_o = np.array(pair_o)
+    pair_th = np.array(pair_th)
 
     print(f"T2 / T3   (paired trials: {len(pair_t)} of {len(touch)} touch events)")
     if not len(pair_t):
         print("  nothing paired")
         return
 
+    # theta is the per-trial correction, so drift across the session is already
+    # in it; nothing below assumes one offset for the whole recording.
     theta = pair_th
-    report_stat("T2 touch -> OS report", (pair_t + theta) - pair_f)
-    report_stat("T3 OS report -> photon", pair_p - (pair_t + theta))
+    t2 = (pair_t + theta) - pair_f
+    t3 = pair_p - (pair_t + theta)
+    report_stat("T2 touch -> handler", t2)
+    if np.isfinite(pair_o).any():
+        report_stat("  T2a touch -> OS stamp", (pair_o + theta) - pair_f)
+        report_stat("  T2b OS stamp -> handler", pair_t - pair_o)
+    else:
+        print("  (no OS touch timestamp in ch4; T2 cannot be split)")
+    report_stat("T3 handler -> photon", t3)
     print()
 
-    lo = np.max(pair_f - pair_t)
-    hi = np.min(pair_p - pair_t) - D_MIN
-    med = float(np.median(theta))
-    print("theta bracket from physics alone (independent of LSL)")
-    print(f"  T2 >= 0        => theta >= {lo:+.6f} s")
-    print(f"  T3 >= {D_MIN*1e3:.0f} ms   => theta <= {hi:+.6f} s")
+    # If theta is off by delta (true = theta + delta), then true T2 = T2 + delta
+    # and true T3 = T3 - delta. Requiring T2 >= 0 and T3 >= D_MIN in every trial
+    # bounds delta from both sides; time_correction is consistent with physics
+    # when 0 lies inside. Working in delta rather than theta keeps the session's
+    # clock drift (already in the per-trial theta) out of the bracket.
+    lo = -t2.min()
+    hi = t3.min() - D_MIN
+    n_t2 = int((t2 < 0).sum())
+
+    print("theta error bracket from physics alone (independent of LSL)")
+    print(f"  T2 >= 0        => error >= {lo*1e3:+.2f} ms")
+    print(f"  T3 >= {D_MIN*1e3:.0f} ms   => error <= {hi*1e3:+.2f} ms")
     print(f"  width                : {(hi-lo)*1e3:.2f} ms")
-    print(f"  LSL time_correction  : {med:+.6f} s  -> "
-          f"{'INSIDE bracket' if lo <= med <= hi else 'OUTSIDE BRACKET (!)'}")
-    if not (lo <= med <= hi):
+    if n_t2:
+        print(f"  {n_t2} of {len(t2)} trial(s) have T2 < 0: the handler ran before the FSR")
+        print("  edge. The FSR needs force, so a light touch can register first;")
+        print("  those trials, not the clock, may be what breaks the bracket.")
+    inside = lo <= 0.0 <= hi
+    print(f"  LSL time_correction  : median {np.median(theta):+.6f} s  -> "
+          f"{'INSIDE bracket' if inside else 'OUTSIDE BRACKET (!)'}")
+    if not inside:
         print("  The network path is badly asymmetric, or an assumption above is")
         print("  wrong. Do not report T2/T3 without investigating.")
-
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
